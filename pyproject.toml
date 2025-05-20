@@ -1,0 +1,21 @@
+[project]
+name = "agentic_generative_ui"
+version = "0.1.0"
+description = "agentic_generative_ui using crewAI"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "crewai[tools]>=0.118.0,<1.0.0",
+]
+
+[project.scripts]
+kickoff = "agentic_generative_ui.main:kickoff"
+run_crew = "agentic_generative_ui.main:kickoff"
+plot = "agentic_generative_ui.main:plot"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.crewai]
+type = "flow"
