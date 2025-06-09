@@ -40,7 +40,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tool definition
+# Tool definitions
 # ---------------------------------------------------------------------------
 GENERATE_TASK_STEPS_TOOL: Dict[str, Any] = {
     "type": "function",
@@ -73,6 +73,22 @@ GENERATE_TASK_STEPS_TOOL: Dict[str, Any] = {
                 },
             },
             "required": ["task", "steps"],
+        },
+    },
+}
+
+SIMULATE_STEP_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "simulate_step",
+        "description": "Simulate execution of a single task step",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "step_number": {"type": "integer", "description": "Step number being executed"},
+                "description": {"type": "string", "description": "Step description"},
+            },
+            "required": ["step_number", "description"],
         },
     },
 }
@@ -168,44 +184,57 @@ Current task state ↓↓↓
     # -------------------- SIMULATE STAGE ------------------------------
     @listen("route_simulate_task")
     def simulate_task(self):
-        """Emit progress for each step then return stored assistant reply."""
+        """Simulate task execution using LLM tool calls for each step."""
 
         try:
             assert self.state.task_steps, "No task steps to simulate"
 
-            for step in self.state.task_steps["steps"]:
-                idx = step["step_number"]
-                desc = step["description"]
+            # Get enabled steps only
+            enabled_steps = [
+                step for step in self.state.task_steps["steps"]
+                if step.get("status") != "disabled"
+            ]
 
-                # Only simulate steps that aren't disabled (skip disabled ones)
-                if step.get("status") == "disabled":
-                    continue
+            if not enabled_steps:
+                final_response = "No steps to execute! 🤷‍♂️"
+                self._update_history_with_final(final_response)
+                return json.dumps({"response": final_response, "id": self.state.id})
 
-                # start event
-                start_time = datetime.now()
-                self.emit_event(
-                    ToolUsageStartedEvent,
-                    data={
-                        "tool_name": "task_step",
-                        "tool_args": {"index": idx, "description": desc}
-                    },
-                )
-                time.sleep(0.5)  # fake work
-                step["status"] = "completed"
-                # end event
-                self.emit_event(
-                    ToolUsageFinishedEvent,
-                    data={
-                        "tool_name": "task_step",
-                        "tool_args": {"index": idx, "description": desc},
-                        "started_at": start_time,
-                        "finished_at": datetime.now(),
-                        "output": f"Completed step {idx}: {desc}"
-                    },
-                )
+            # Create simulation prompt
+            steps_list = "\n".join([
+                f"{step['step_number']}. {step['description']}"
+                for step in enabled_steps
+            ])
+
+            simulation_prompt = f"""
+You must execute ALL of the following task steps by calling simulate_step for each one in order:
+
+{steps_list}
+
+IMPORTANT: Call simulate_step for EVERY single step above (steps 1-{len(enabled_steps)}), then provide a fun summary with emojis about completing the task.
+"""
+
+            # Use LLM to simulate steps via tool calls
+            messages = [{"role": "user", "content": simulation_prompt}]
+            llm = LLM(model="gpt-4o", stream=True)
+
+            before_tool_calls = len(tool_calls_log)
+            response_text = llm.call(
+                messages=messages,
+                tools=[SIMULATE_STEP_TOOL],
+                available_functions={
+                    "simulate_step": self.simulate_step_handler,
+                },
+            )
+
+            final_response = self.handle_tool_responses(
+                llm=llm,
+                response_text=response_text,
+                messages=messages,
+                tools_called_count_before_llm_call=before_tool_calls,
+            )
 
             self.state.simulated = True
-            final_response = self.state.latest_assistant_response or "All done ✅"
             self._update_history_with_final(final_response)
             return json.dumps({"response": final_response, "id": self.state.id})
 
@@ -222,12 +251,26 @@ Current task state ↓↓↓
                 self.state.conversation_history.append(msg)
         self.state.conversation_history.append({"role": "assistant", "content": assistant_text})
 
-    # ---------------- tool handler -----------------
+    # ---------------- tool handlers -----------------
     def generate_task_steps_handler(self, task: str, steps: List[Dict[str, Any]]):
         task_steps = TaskSteps(task=task, steps=steps)
         self.state.task_steps = task_steps.model_dump()
         logger.info(f"Generated {len(steps)} steps for task: {task}")
         return f"✅ Generated {len(steps)} steps for: {task}"
+
+    def simulate_step_handler(self, step_number: int, description: str):
+        """Simulate execution of a single step with artificial delay."""
+        time.sleep(1)  # Simulate work being done
+
+        # Update the step status in state
+        if self.state.task_steps:
+            for step in self.state.task_steps["steps"]:
+                if step["step_number"] == step_number:
+                    step["status"] = "completed"
+                    break
+
+        logger.info(f"Simulated step {step_number}: {description}")
+        return f"✅ Completed step {step_number}: {description}"
 
     def __repr__(self):  # pragma: no cover
         return json.dumps({"state": self.state.model_dump()}, indent=2)
@@ -240,8 +283,18 @@ def kickoff() -> int:  # pragma: no cover
     try:
         flow_instance = AgenticGenerativeUIFlow()
         user_msg = {"role": "user", "content": "Build a time machine!"}
+
+        # Initial chat step (generates steps)
         result = flow_instance.kickoff({"messages": [user_msg], "task_steps": None})
-        logger.info("Kickoff result: %s", result)
+        logger.info("First step result: %s", result)
+
+        # If it returns route_simulate_task, manually trigger simulation
+        if result == "route_simulate_task":
+            logger.info("Triggering simulation...")
+            simulation_result = flow_instance.simulate_task()
+            logger.info("Simulation result: %s", simulation_result)
+            return 0
+
         return 0
     except Exception as e:
         logger.error("Fatal during kickoff: %s", e)
